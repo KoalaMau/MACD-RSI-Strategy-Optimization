@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 from itertools import product
 import mplfinance as mpf
 import yfinance as yf
-
+import numpy as np
 
 # -------------------------------------------
 # 1. Indicator Calculations
@@ -73,49 +73,52 @@ def backtest_strategy(data, rsi_over_sold, investment_amount=1000):
     return data, strategy_return
 
 
-def backtest_monthly(data, investment_amount=1000):
-    """
-    Backtest a simple strategy: buy at the end of every month.
-    Each month on the last available trading day, invest a fixed amount.
-    """
+def backtest_monthly(data, signal_buy_data, investment_amount=1000):
     data = data.copy()
-    # Group by year-month and take the last available date in each month.
     monthly_dates = data.index.to_series().groupby(data.index.to_period('M')).last()
     positions = []
     data['monthly_investment'] = 0.0
+    data['monthly_portfolio'] = 0.0
+
+    total_invested = 0.0
 
     for date in monthly_dates:
         if date in data.index:
+            closest_signal_date = signal_buy_data[signal_buy_data.index <= date].index.max()
+            if pd.isna(closest_signal_date):
+                continue
+
+            signal_investment = signal_buy_data.loc[closest_signal_date, 'investment']
+
+            # The FIX: Check if it's a Series and get the single value
+            if isinstance(signal_investment, pd.Series):
+                if signal_investment.empty: # Check if the series is empty
+                    continue
+                signal_investment = signal_investment.iloc[0]  # Extract the single value
+
+            if signal_investment == 0:  # Now this works correctly
+                continue
+
             price = data.loc[date, 'Close']
-            shares = investment_amount / price
-            positions.append({'date': date, 'shares': shares, 'buy_price': price})
-            data.loc[date, 'monthly_investment'] = investment_amount
+            shares = signal_investment / price
+            positions.append({'date': date, 'shares': shares, 'buy_price': price, 'investment': signal_investment})
+            data.loc[date, 'monthly_investment'] = signal_investment
+            total_invested += signal_investment
 
-    total_invested = investment_amount * len(positions)
     final_price = data['Close'].iloc[-1]
-    # CRUCIAL FIX: Ensure portfolio_value is a scalar float
-    portfolio_value = 0.0  # Initialize to a float
-    if positions:  # Check if positions list is not empty
-        portfolio_value = sum(pos['shares'] * final_price for pos in positions)
-
+    portfolio_value = sum(pos['shares'] * final_price for pos in positions)
     monthly_return = portfolio_value / total_invested if total_invested > 0 else 0
 
-    # Correct portfolio value calculation:  AVOID in-place operations!
-    pv = pd.Series(0.0, index=data.index)  # Initialize with float for consistency
-
+    # Efficient Portfolio Value Calculation (same as before)
+    pv = pd.Series(0.0, index=data.index)
     for pos in positions:
         shares_series = pd.Series(0.0, index=data.index)
         shares_series.loc[pos['date']:] = pos['shares']
-
-        # The crucial fix: Ensure data['Close'] is a Series
-        close_prices = data['Close'] if isinstance(data['Close'], pd.Series) else data[
-            'Close'].squeeze()  # .squeeze() is crucial to avoid dataframe.
-
+        close_prices = data['Close'] if isinstance(data['Close'], pd.Series) else data['Close'].squeeze()
         pv = pv.add(shares_series * close_prices, fill_value=0)
-
     data['monthly_portfolio'] = pv
-    return data, monthly_return
 
+    return data, monthly_return
 
 # -------------------------------------------
 # 3. Parameter Optimization
@@ -194,7 +197,6 @@ def plot_monthly_signals(data, ticker):
     plt.tight_layout()
     plt.show()
 
-
 # -------------------------------------------
 # 5. Main Script
 # -------------------------------------------
@@ -209,13 +211,13 @@ if __name__ == "__main__":
     # Define parameter ranges for optimization
     # You can adjust these ranges as needed.
     macd_params = {
-        'short_window': range(2, 15, 1),  # e.g., 10, 11, 12, 13, 14
-        'long_window': range(2, 27, 1),  # e.g., 20,...,26
-        'signal_window': range(2, 13, 1)  # e.g., 8,9,10,11,12
+        'short_window': range(2, 3, 1),  # e.g., 10, 11, 12, 13, 14
+        'long_window': range(22, 24, 2),  # e.g., 20,...,26
+        'signal_window': range(2, 4, 2)  # e.g., 8,9,10,11,12
     }
     rsi_params = {
-        'rsi_period': range(10, 16, 1),  # e.g., 10,...,15
-        'rsi_over_sold': range(25, 50, 5)  # e.g., 25, 30, 35, 40
+        'rsi_period': range(14, 15,1),  # e.g., 10,...,15
+        'rsi_over_sold': range(45, 50, 5)  # e.g., 25, 30, 35, 40
     }
 
     # -----------------------------
@@ -235,7 +237,8 @@ if __name__ == "__main__":
     calculate_macd(data, best_short, best_long, best_signal)
     calculate_rsi(data, best_rsi_period)
 
-    strat_data, strategy_return = backtest_strategy(data, best_rsi_over_sold, investment_amount=1000)
+    strat_data, strategy_return = backtest_strategy(data, best_rsi_over_sold, investment_amount=1000) # Run the strategy
+
 
     # The key change is here: Check if strategy_return is a Series
     if isinstance(strategy_return, pd.Series):
@@ -245,12 +248,29 @@ if __name__ == "__main__":
 
     # -----------------------------
     # Backtest the monthly buying strategy for comparison.
-    monthly_data, monthly_return = backtest_monthly(data, investment_amount=1000)
+    signal_buy_data = strat_data[strat_data['buy_signal']].copy()  # Create a copy of the buy signals data
+    signal_buy_data = signal_buy_data[['investment']]  # keep only the investment column
+
+    monthly_data, monthly_return = backtest_monthly(data, signal_buy_data,
+                                                    investment_amount=1000)  # Pass signal_buy_data
+
     # The ULTIMATE fix: Check if monthly_return is a Series and extract the value
     if isinstance(monthly_return, pd.Series):
         monthly_return = monthly_return.iloc[0]  # Get the first element if it's a Series
 
     print(f"Monthly Buying Strategy Return: {monthly_return:.4f}")
+
+    initial_price = data['Close'].iloc[0]
+    final_price = data['Close'].iloc[-1]
+
+    # Calculate the return.  If you want a single value, use .iloc[0]
+    buy_and_hold_return = (final_price / initial_price)
+
+    # Check if it's a Series and extract the single value if needed
+    if isinstance(buy_and_hold_return, pd.Series):
+        buy_and_hold_return = buy_and_hold_return.iloc[0]
+
+    print(f"Buy and Hold Return: {buy_and_hold_return:.4f}")
 
     # -----------------------------
     # Plot the results of the signal-based strategy (using the new function)
